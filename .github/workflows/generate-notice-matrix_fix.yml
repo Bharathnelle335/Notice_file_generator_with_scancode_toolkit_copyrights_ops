@@ -45,6 +45,7 @@ jobs:
         run: |
           python - <<'PY'
           import json, os, re, math
+          from pathlib import Path   # <-- required for Path("pages.json")
           NOASSERT={"NOASSERTION","NONE","",None}
 
           def norm(s):
@@ -139,7 +140,6 @@ jobs:
                       if not merged[key].get(fld) and c.get(fld): merged[key][fld]=c[fld]
 
           items=list(merged.values())
-          # add safe_name
           for i,c in enumerate(items):
               base = c.get("purl") or c.get("name") or f"component-{i}"
               c["safe_name"] = slug(base)
@@ -156,7 +156,7 @@ jobs:
                   "components": page_items
               })
 
-          # matrix for page jobs: only include page_index + count to stay small
+          # matrix for page jobs: only include page_index + count
           matrix={"include":[{"page_index": i, "count": pages[i]["count"]} for i in range(len(pages))]}
 
           # outputs
@@ -167,7 +167,7 @@ jobs:
               gh.write(f"total={total}\n")
               gh.write(f"title={os.environ.get('TITLE','Open Source Notices')}\n")
 
-          # also dump the full pages payload to workspace for page jobs
+          # dump full pages payload to workspace for scan-page jobs
           Path("pages.json").write_text(json.dumps({"pages": pages}, ensure_ascii=False), encoding="utf-8")
           PY
         env:
@@ -189,7 +189,7 @@ jobs:
           echo "- Pages: **$(( ( ${{ steps.mk.outputs.total }} + ${{ steps.mk.outputs.page_size }} - 1 ) / ${{ steps.mk.outputs.page_size }} ))**" >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------
-  # Job 2: Scan-page — matrix over pages (each job scans ≤PAGE_SIZE comps)
+  # Job 2: Scan-page — matrix over pages (each scans ≤PAGE_SIZE comps)
   # ---------------------------------------------------------
   scan-page:
     needs: prepare
@@ -387,41 +387,31 @@ jobs:
         env:
           PAGE_INDEX: ${{ matrix.page_index }}
 
-      - name: Upload all artifacts from this page
-        # Find every 'scan.json' and 'meta.json' in the page workspace and upload separately.
+      - name: Package per-component outputs in this page
+        shell: bash
         run: |
+          set -e
+          mkdir -p page_out
           find .scancode_work -type f \( -name "scan.json" -o -name "meta.json" \) -print0 | xargs -0 -I {} dirname {} | sort -u > dirs.txt
           while read d; do
             base=$(basename "$d")
-            # Two files expected: scan.json + meta.json
-            files=$(ls "$d"/scan.json "$d"/meta.json 2>/dev/null || true)
-            if [ -n "$files" ]; then
-              echo "Uploading $base"
-              # Each artifact must have a unique, safe name (v4 artifacts are immutable). [3](https://github.com/actions/upload-artifact/blob/main/docs/MIGRATION.md)
-              ghname="scan-${{ matrix.page_index }}-${base}"
-              echo "$files"
-              tar -czf "$ghname.tgz" -C "$d" scan.json meta.json
-              echo "::group::Upload $ghname"
-              gh -v >/dev/null 2>&1 || true
-              # Use the official action to upload
-              echo "::endgroup::"
-              echo "::group::Upload via action"
+            if [ -f "$d/scan.json" ] && [ -f "$d/meta.json" ]; then
+              tar -czf "page_out/scan-${{ matrix.page_index }}-${base}.tgz" -C "$d" scan.json meta.json
+              echo "Packaged: scan-${{ matrix.page_index }}-${base}.tgz"
             fi
           done < dirs.txt
-        shell: bash
 
-      - name: Upload compressed page artifacts (reliable)
+      - name: Upload compressed page artifacts
         uses: actions/upload-artifact@v4
         with:
           name: page-${{ matrix.page_index }}
-          path: |
-            *.tgz
+          path: page_out/*.tgz
           if-no-files-found: warn
 
       - name: Page summary
         run: |
           echo "### Page ${{ matrix.page_index }} scanned" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Components scanned: **${{ steps.scan.outputs.scanned }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Components scanned (with outputs): **$(ls -1 page_out/*.tgz 2>/dev/null | wc -l)**" >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------
   # Job 3: Merge — download artifacts, build NOTICE
